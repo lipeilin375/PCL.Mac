@@ -1,84 +1,316 @@
+````yaml
 name: Build macOS App
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+    tags:
+      - "v*"
+
   workflow_dispatch:
+
+# Release Job 需要创建 GitHub Release
+permissions:
+  contents: write
 
 jobs:
   build:
+    name: Build PCL.Mac
     runs-on: macos-15
+
     steps:
+      # ============================================================
+      # 1. Checkout
+      # ============================================================
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # ============================================================
+      # 2. Setup Xcode
+      # ============================================================
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest
 
-      - name: Install dependencies (if using CocoaPods)
+      # ============================================================
+      # 3. Install CocoaPods if needed
+      # ============================================================
+      - name: Install dependencies
         run: |
           if [ -f "Podfile" ]; then
             sudo gem install cocoapods
             pod install
           fi
-      
+
+      # ============================================================
+      # 4. Generate Secrets.xcconfig
+      # ============================================================
       - name: Generate Secrets.xcconfig
         run: |
-            echo "IS_DEVELOPMENT = false" >> Secrets.xcconfig
-            echo "BRANCH = $BRANCH" >> Secrets.xcconfig
+          echo "IS_DEVELOPMENT = false" >> Secrets.xcconfig
+          echo "BRANCH = $BRANCH" >> Secrets.xcconfig
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           BRANCH: ${{ github.ref_name }}
-    
+
+      # ============================================================
+      # 5. Replace secrets in Secrets.swift
+      # ============================================================
       - name: Replace secrets
         run: |
-            sed -i '' "s/{{ARTIFACT_PAT}}/$ARTIFACT_PAT/g" PCL.Mac/Secrets.swift
-            sed -i '' "s/{{CLIENT_ID}}/$CLIENT_ID/g" PCL.Mac/Secrets.swift
-            sed -i '' "s/{{THEME_KEY}}/$THEME_KEY/g" PCL.Mac/Secrets.swift
+          sed -i '' "s/{{ARTIFACT_PAT}}/$ARTIFACT_PAT/g" PCL.Mac/Secrets.swift
+          sed -i '' "s/{{CLIENT_ID}}/$CLIENT_ID/g" PCL.Mac/Secrets.swift
+          sed -i '' "s/{{THEME_KEY}}/$THEME_KEY/g" PCL.Mac/Secrets.swift
         env:
           ARTIFACT_PAT: ${{ secrets.ARTIFACT_PAT }}
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           THEME_KEY: ${{ secrets.THEME_KEY }}
 
-      - name: Build Universal Binary (xcodebuild)
+      # ============================================================
+      # 6. Build Universal Binary
+      # ============================================================
+      - name: Build Universal Binary
         run: |
+          set -e
+
           PROJECT="PCL.Mac.xcodeproj"
           SCHEME="PCL.Mac"
 
-          if [ -d "$PROJECT" ]; then
-            xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -archivePath build \
-              -xcconfig Secrets.xcconfig \
-              ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
-              CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO archive
-          else
+          if [ ! -d "$PROJECT" ]; then
             echo "PCL.Mac.xcodeproj not found!"
             exit 1
           fi
 
+          echo "========================================"
+          echo "Building PCL.Mac"
+          echo "Project: $PROJECT"
+          echo "Scheme:  $SCHEME"
+          echo "========================================"
+
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -archivePath build \
+            -xcconfig Secrets.xcconfig \
+            ARCHS="arm64 x86_64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            archive
+
+      # ============================================================
+      # 7. Copy .app
+      # ============================================================
       - name: Copy .app to build/Release
         run: |
+          set -e
+
           mkdir -p build/Release
+
           APP_PATH="build.xcarchive/Products/Applications/PCL.Mac.app"
-          if [ -d "$APP_PATH" ]; then
-            cp -R "$APP_PATH" build/Release/
-          else
+
+          if [ ! -d "$APP_PATH" ]; then
             echo "PCL.Mac.app not found!"
+            echo "Expected path:"
+            echo "$APP_PATH"
             exit 1
           fi
 
+          cp -R "$APP_PATH" build/Release/
+
+          echo "Application copied successfully:"
+          ls -lah build/Release/
+
+      # ============================================================
+      # 8. Verify Universal Binary
+      # ============================================================
       - name: Verify Universal Binary
         run: |
-          file build/Release/PCL.Mac.app/Contents/MacOS/PCL.Mac
+          set -e
 
-      - name: Zip PCL.Mac.app
+          BINARY="build/Release/PCL.Mac.app/Contents/MacOS/PCL.Mac"
+
+          if [ ! -f "$BINARY" ]; then
+            echo "Executable not found:"
+            echo "$BINARY"
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "Binary architecture:"
+          echo "========================================"
+
+          file "$BINARY"
+          lipo -info "$BINARY"
+
+      # ============================================================
+      # 9. Show App information
+      # ============================================================
+      - name: Show App information
         run: |
-          cd build/Release
-          zip -r PCL.Mac.zip PCL.Mac.app
+          echo "========================================"
+          echo "PCL.Mac.app information"
+          echo "========================================"
 
-      - name: Archive build products
+          /usr/libexec/PlistBuddy \
+            -c "Print :CFBundleShortVersionString" \
+            build/Release/PCL.Mac.app/Contents/Info.plist || true
+
+          /usr/libexec/PlistBuddy \
+            -c "Print :CFBundleVersion" \
+            build/Release/PCL.Mac.app/Contents/Info.plist || true
+
+      # ============================================================
+      # 10. Create ZIP
+      # ============================================================
+      - name: Create ZIP package
+        run: |
+          set -e
+
+          cd build/Release
+
+          zip \
+            -r \
+            -y \
+            "PCL.Mac-${GITHUB_REF_NAME}-macOS.zip" \
+            PCL.Mac.app
+
+          echo "ZIP created:"
+          ls -lh "PCL.Mac-${GITHUB_REF_NAME}-macOS.zip"
+
+      # ============================================================
+      # 11. Create DMG
+      # ============================================================
+      - name: Create DMG package
+        run: |
+          set -e
+
+          mkdir -p dmg-root
+          mkdir -p dist
+
+          # Copy application
+          cp -R build/Release/PCL.Mac.app dmg-root/
+
+          # Create Applications shortcut
+          ln -s /Applications dmg-root/Applications
+
+          # Create DMG
+          hdiutil create \
+            -volname "PCL.Mac" \
+            -srcfolder dmg-root \
+            -ov \
+            -format UDZO \
+            "dist/PCL.Mac-${GITHUB_REF_NAME}-macOS.dmg"
+
+          echo "DMG created:"
+          ls -lh "dist/PCL.Mac-${GITHUB_REF_NAME}-macOS.dmg"
+
+      # ============================================================
+      # 12. Copy ZIP to dist
+      # ============================================================
+      - name: Prepare release files
+        run: |
+          set -e
+
+          mkdir -p dist
+
+          cp \
+            "build/Release/PCL.Mac-${GITHUB_REF_NAME}-macOS.zip" \
+            dist/
+
+          echo "Release files:"
+          ls -lah dist/
+
+      # ============================================================
+      # 13. Generate SHA256 checksums
+      # ============================================================
+      - name: Generate SHA256 checksums
+        run: |
+          set -e
+
+          cd dist
+
+          shasum -a 256 \
+            "PCL.Mac-${GITHUB_REF_NAME}-macOS.dmg" \
+            "PCL.Mac-${GITHUB_REF_NAME}-macOS.zip" \
+            > SHA256SUMS.txt
+
+          echo "SHA256:"
+          cat SHA256SUMS.txt
+
+      # ============================================================
+      # 14. Upload GitHub Actions Artifact
+      #
+      # 即使 Release 失败，也可以在 Actions 页面下载构建结果
+      # ============================================================
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: PCL.Mac
-          path: build/Release/PCL.Mac.zip
+          name: PCL.Mac-${{ github.ref_name }}-macOS
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      # ============================================================
+      # 15. Publish GitHub Release
+      #
+      # 只有 v* Tag 才会执行
+      # ============================================================
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: PCL.Mac ${{ github.ref_name }}
+          generate_release_notes: true
+
+          files: |
+            dist/PCL.Mac-${{ github.ref_name }}-macOS.dmg
+            dist/PCL.Mac-${{ github.ref_name }}-macOS.zip
+            dist/SHA256SUMS.txt
+
+          body: |
+            ## PCL.Mac ${{ github.ref_name }}
+
+            macOS Universal Release.
+
+            ### 下载
+
+            - **DMG**：推荐普通用户使用
+            - **ZIP**：直接解压运行
+            - **SHA256SUMS.txt**：文件完整性校验
+
+            ### 系统要求
+
+            - macOS 14.0+
+            - Apple Silicon
+            - Intel Mac
+
+            ### 注意
+
+            当前版本尚未进行 Apple Developer ID 签名和 Notarization。
+
+            如果 macOS 提示应用无法打开或应用已损坏，请前往：
+
+            `系统设置 → 隐私与安全性 → 安全性`
+
+            找到 PCL.Mac 并选择允许打开。
+
+            也可以在终端执行：
+
+            ```bash
+            xattr -cr /Applications/PCL.Mac.app
+            ```
+
+            然后重新打开应用。
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+````
