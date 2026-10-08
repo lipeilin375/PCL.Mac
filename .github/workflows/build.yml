@@ -1,4 +1,3 @@
-````yaml
 name: Build macOS App
 
 on:
@@ -313,4 +312,3 @@ jobs:
 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-````
